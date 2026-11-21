@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import JSON, String, UniqueConstraint
+from sqlalchemy import JSON, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from src.config.database import Base
 from src.utils.time import now
@@ -14,5 +14,17 @@ class Dataset(Base):
     checksum: Mapped[str] = mapped_column(String(64))
     rows: Mapped[list] = mapped_column(JSON)
     row_count: Mapped[int]
+    author: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(default=now)
+
+class ForwardLink(Base):
+    __tablename__ = 'forward_links'
+    __table_args__ = (UniqueConstraint('dataset_id', 'left_id', 'right_id'),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    dataset_id: Mapped[int] = mapped_column(ForeignKey('datasets.id'), index=True)
+    left_id: Mapped[str] = mapped_column(String(80))
+    right_id: Mapped[str] = mapped_column(String(80))
+    version: Mapped[int]
     author: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(default=now)

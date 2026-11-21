@@ -11,6 +11,7 @@ from src.models.identity import User
 from src.models.jobs import Run
 from src.models.source import Dataset
 from src.schemas.requests import ReviewRequest, RunRequest
+from src.services import forwards
 from src.services.audit import record
 from src.services.validation import normalize_params
 from src.utils import views
@@ -34,12 +35,15 @@ def index(db: Session = Depends(connection), actor: User = Depends(current)):
 @router.post('', status_code=202)
 def create(body: RunRequest, db: Session = Depends(connection),
            actor: User = Depends(allow(Role.ADMIN, Role.ANALYST))):
-    if not db.get(Dataset, body.dataset_id):
+    dataset = db.get(Dataset, body.dataset_id, with_for_update=True)
+    if not dataset:
         raise HTTPException(404, '找不到指定的数据批次')
-    item = Run(name=body.name, dataset_id=body.dataset_id, params=normalize_params(body.params), author=actor.username)
+    version = forwards.current_version(db, dataset.id)
+    item = Run(name=body.name, dataset_id=body.dataset_id, params=normalize_params(body.params),
+               author=actor.username, relation_version=version)
     db.add(item)
     db.flush()
-    record(db, actor.username, 'analysis.queued', item.id, dataset_id=item.dataset_id)
+    record(db, actor.username, 'analysis.queued', item.id, dataset_id=item.dataset_id, relation_version=version)
     db.commit()
     wake()
     return views.run(item, detail=True)

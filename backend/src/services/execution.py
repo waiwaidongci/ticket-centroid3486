@@ -7,6 +7,7 @@ from src.domain.analysis import analyze
 from src.domain.spec import SPEC
 from src.models.jobs import Delivery, Run, Schedule
 from src.models.source import Dataset
+from src.services import forwards
 from src.services.audit import record
 from src.utils.exports import write_report
 from src.utils.time import now
@@ -37,7 +38,8 @@ def materialize_due():
             else:
                 item.enabled = False
             db.add(Run(dataset_id=dataset_id, schedule_id=item.id, scheduled_at=due,
-                       name=item.name, params=params, author=item.author))
+                       name=item.name, params=params, author=item.author,
+                       relation_version=forwards.current_version(db, dataset_id)))
 
 
 def claim():
@@ -57,15 +59,17 @@ def claim():
         job.status = Status.RUNNING
         job.attempt += 1
         job.lease_until = stamp + timedelta(minutes=3)
-        records = db.get(Dataset, job.dataset_id).rows
-        return job.id, job.attempt, records, job.params
+        dataset = db.get(Dataset, job.dataset_id)
+        version = job.relation_version or 0
+        relations = {'version': version, 'links': forwards.links_upto(db, job.dataset_id, version)}
+        return job.id, job.attempt, dataset.rows, job.params, relations
 
 
 def execute(lease):
-    job_id, attempt, rows, params = lease
+    job_id, attempt, rows, params, relations = lease
     result = export = failure = None
     try:
-        result = analyze(rows, params)
+        result = analyze(rows, params, relations)
         export = write_report(job_id, attempt, result)
     except ValueError as error:
         failure = str(error)[:500]

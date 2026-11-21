@@ -5,10 +5,12 @@ from sqlalchemy.orm import Session
 from src.config.database import connection
 from src.constants.enums import Role
 from src.controllers.auth import allow, current
+from src.domain.analysis import cross_batch_chains
 from src.domain.spec import SPEC
 from src.models.identity import User
-from src.models.source import Dataset
-from src.schemas.requests import Upload
+from src.models.source import Dataset, ForwardLink
+from src.schemas.requests import ForwardUpload, Upload
+from src.services import forwards
 from src.services.audit import record
 from src.services.datasets import save, template
 from src.services.validation import parse_rows
@@ -29,6 +31,13 @@ def sample(actor: User = Depends(current)):
                     headers={'Content-Disposition': f"attachment; filename*=UTF-8''{filename}"})
 
 
+@router.get('/forwards/template')
+def forward_sample(actor: User = Depends(current)):
+    filename = quote(SPEC['forward_sample_name'])
+    return Response(forwards.template(), media_type='text/csv; charset=utf-8',
+                    headers={'Content-Disposition': f"attachment; filename*=UTF-8''{filename}"})
+
+
 @router.get('/datasets')
 def datasets(db: Session = Depends(connection), actor: User = Depends(current)):
     return [views.dataset(item) for item in db.scalars(select(Dataset).order_by(Dataset.id.desc()).limit(100))]
@@ -41,6 +50,33 @@ def details(dataset_id: int, offset: int = Query(0, ge=0), limit: int = Query(16
     if not item:
         raise HTTPException(404, '找不到该数据批次')
     return {**views.dataset(item), 'rows': item.rows[offset:offset + limit]}
+
+
+@router.get('/datasets/{dataset_id}/forwards')
+def forward_links(dataset_id: int, db: Session = Depends(connection), actor: User = Depends(current)):
+    item = db.get(Dataset, dataset_id)
+    if not item:
+        raise HTTPException(404, '找不到该数据批次')
+    links = db.scalars(select(ForwardLink).where(ForwardLink.dataset_id == dataset_id)
+                       .order_by(ForwardLink.id)).all()
+    version = max((link.version for link in links), default=0)
+    chains = cross_batch_chains(item.rows, [[link.left_id, link.right_id] for link in links])
+    return {'dataset_id': item.id, 'version': version,
+            'links': [views.forward_link(link) for link in links],
+            'chains': [views.chain(chain) for chain in chains]}
+
+
+@router.post('/datasets/{dataset_id}/forwards', status_code=201)
+def supplement(dataset_id: int, body: ForwardUpload, db: Session = Depends(connection),
+               actor: User = Depends(allow(Role.ADMIN, Role.ANALYST))):
+    item = db.get(Dataset, dataset_id, with_for_update=True)
+    if not item:
+        raise HTTPException(404, '找不到该数据批次')
+    pairs, skipped = forwards.parse_links(body.csv_text, item.rows)
+    version, added, skipped = forwards.save_links(db, item, pairs, actor.username, skipped)
+    record(db, actor.username, 'forwards.imported', item.id, version=version, added=added, skipped=skipped)
+    db.commit()
+    return {'dataset_id': item.id, 'version': version, 'added': added, 'skipped': skipped}
 
 
 @router.post('/datasets', status_code=201)

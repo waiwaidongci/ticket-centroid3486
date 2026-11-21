@@ -13,8 +13,20 @@ def run(item, detail=False):
                  'scheduled_at': iso(item.scheduled_at), 'schedule_id': item.schedule_id,
                  'has_export': bool(item.export_file), 'error': item.error}
     if detail:
-        item_view.update(params=item.params, result=item.result, review_note=item.review_note)
+        item_view.update(params=item.params, result=item.result, review_note=item.review_note,
+                         relation_version=item.relation_version or 0)
     return item_view
+
+
+def forward_link(item):
+    return {'left_id': item.left_id, 'right_id': item.right_id, 'version': item.version,
+            'author': item.author, 'created_at': iso(item.created_at)}
+
+
+def chain(item):
+    return {'chain': item['chain'], 'links': [f'{left} ↔ {right}' for left, right in item['links']],
+            'tickets': [{'ticket_id': ticket['ticket_id'], 'split': ticket['split'], 'label': ticket['label']}
+                        for ticket in item['tickets']]}
 
 
 def schedule(item):

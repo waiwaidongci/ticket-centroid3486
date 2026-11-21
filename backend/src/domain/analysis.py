@@ -1,7 +1,7 @@
 """用固定留出批验收剧场来信的质心分流。"""
 
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from math import fsum, isclose, log, sqrt
 from unicodedata import normalize
 
@@ -21,6 +21,14 @@ _QUEUE_COLUMNS = (
     ("recall", "召回率"), ("f1", "F1"), ("baseline_f1", "基线 F1"),
     ("top_terms", "质心代表词"), ("handling", "接件说明"),
 )
+_EXCLUSION_COLUMNS = (
+    ("chain", "剔除链路"), ("ticket_id", "来信编号"), ("split", "原批次"),
+    ("label", "人工归口"), ("links", "串内转发关系"), ("reason", "剔除依据"),
+)
+
+
+def _identifier(text):
+    return normalize("NFKC", str(text)).casefold()
 
 
 def validate_rows(rows):
@@ -42,12 +50,58 @@ def validate_rows(rows):
             if field["type"] == "select" and value not in field["options"]:
                 raise ValueError(f"第 {index} 条来信的「{field['label']}」须为：{'、'.join(field['options'])}。")
             ticket[key] = value
-        identifier = normalize("NFKC", ticket["ticket_id"]).casefold()
+        identifier = _identifier(ticket["ticket_id"])
         if identifier in seen:
             raise ValueError(f"来信编号「{ticket['ticket_id']}」重复，同一编号只能出现于一个批次。")
         seen.add(identifier)
         tickets.append(ticket)
     return tickets
+
+
+def cross_batch_chains(rows, links):
+    """按转发关系串连来信，返回横跨训练批与留出批的整串（编号按字典序稳定）。"""
+    tickets = validate_rows(rows)
+    canonical = {}
+    for ticket in tickets:
+        canonical.setdefault(_identifier(ticket["ticket_id"]), ticket["ticket_id"])
+    parent = {ticket["ticket_id"]: ticket["ticket_id"] for ticket in tickets}
+
+    def find(node):
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    edges = set()
+    for pair in links or []:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        left, right = (canonical.get(_identifier(side)) for side in pair)
+        if not left or not right or left == right:
+            continue
+        edges.add(tuple(sorted((left, right))))
+    for left, right in sorted(edges):
+        root_left, root_right = find(left), find(right)
+        if root_left != root_right:
+            parent[root_left] = root_right
+
+    members = defaultdict(list)
+    for ticket in tickets:
+        members[find(ticket["ticket_id"])].append(ticket)
+    chains = []
+    for root in sorted(members, key=lambda node: min(t["ticket_id"] for t in members[node])):
+        group = sorted(members[root], key=lambda ticket: ticket["ticket_id"])
+        splits = {ticket["split"] for ticket in group}
+        chain_links = sorted(pair for pair in edges if find(pair[0]) == root)
+        if len(group) > 1 and splits == {"train", "test"}:
+            chains.append({
+                "chain": len(chains) + 1,
+                "tickets": group,
+                "links": chain_links,
+                "train": sum(1 for ticket in group if ticket["split"] == "train"),
+                "test": sum(1 for ticket in group if ticket["split"] == "test"),
+            })
+    return chains
 
 
 def _parameters(params):
@@ -178,12 +232,21 @@ def _queue_summary(labels, counts, centroids, predictions, majority):
     return rows, fsum(model_scores) / len(labels), fsum(baseline_scores) / len(labels)
 
 
-def analyze(rows, normalized_params):
+def analyze(rows, normalized_params, forwards=None):
     tickets = sorted(validate_rows(rows), key=lambda ticket: ticket["ticket_id"])
     params = _parameters(normalized_params)
-    training = [ticket for ticket in tickets if ticket["split"] == "train"]
-    holdout = [ticket for ticket in tickets if ticket["split"] == "test"]
+    forwards = forwards or {}
+    links = forwards.get("links") or []
+    version = forwards.get("version") or 0
+    chains = cross_batch_chains(tickets, links)
+    removed = {ticket["ticket_id"] for chain in chains for ticket in chain["tickets"]}
+    kept = [ticket for ticket in tickets if ticket["ticket_id"] not in removed]
+    training = [ticket for ticket in kept if ticket["split"] == "train"]
+    holdout = [ticket for ticket in kept if ticket["split"] == "test"]
     if not training or not holdout:
+        if chains:
+            raise ValueError(
+                f"整串剔除 {len(chains)} 串跨批转发来信后，训练批或留出批为空，请核对转发关系补录。")
         raise ValueError("必须同时提供 train 训练件和 test 留出件，批次以导入标记为准。")
     counts = Counter(ticket["label"] for ticket in training)
     if len(counts) < 2:
@@ -202,20 +265,52 @@ def analyze(rows, normalized_params):
     total = len(holdout)
     coverage = (total - manual) / total
     delta = macro_f1 - baseline_f1
+    cut_train = sum(chain["train"] for chain in chains)
+    cut_test = sum(chain["test"] for chain in chains)
+    if chains:
+        relation_note = (
+            f"按转发关系版本 v{version}（{len(links)} 对）剔除 {len(chains)} 串 {len(removed)} 封"
+            f"（训练 {cut_train} 封、留出 {cut_test} 封），其余来信重训并计分。"
+        )
+    elif links:
+        relation_note = f"转发关系版本 v{version}（{len(links)} 对）未发现横跨两批的转发串，按原始批次验收。"
+    else:
+        relation_note = "未补录转发关系，按原始批次验收。"
+    exclusions = [
+        {
+            "chain": f"串{chain['chain']}",
+            "ticket_id": ticket["ticket_id"],
+            "split": ticket["split"],
+            "label": ticket["label"],
+            "links": "；".join(f"{left} ↔ {right}" for left, right in chain["links"]),
+            "reason": f"转发串横跨训练批（{chain['train']} 封）与留出批（{chain['test']} 封），整串剔除",
+        }
+        for chain in chains
+        for ticket in chain["tickets"]
+    ]
     return {
         "state": "warning" if manual or wrong or delta <= 0 else "ok",
         "headline": f"留出 {total} 封，自动分流 {total - manual} 封（错投 {wrong} 封），人工分诊 {manual} 封。",
-        "note": f"训练 {len(training)} 封，使用 {len(idf)} 个训练词，最低相似度 {threshold:g}。多数类基线全部投向{majority}。",
+        "note": (
+            f"训练 {len(training)} 封，使用 {len(idf)} 个训练词，最低相似度 {threshold:g}。"
+            f"多数类基线全部投向{majority}。{relation_note}"
+        ),
         "metrics": [
             {"label": "分流宏 F1", "value": round(macro_f1, 6), "detail": f"{len(labels)} 个队列等权平均，人工分诊计入漏分"},
             {"label": "多数类宏 F1", "value": round(baseline_f1, 6), "detail": f"训练批多数队列为{majority}（{counts[majority]} 封）"},
             {"label": "宏 F1 差值", "value": round(delta, 6), "detail": "分流宏 F1 减多数类宏 F1"},
             {"label": "自动分流覆盖率", "value": f"{coverage:.1%}", "detail": f"{total - manual}/{total} 封进入业务队列"},
             {"label": "人工分诊量", "value": manual, "detail": "阈值、并列和未命中词表的逐件原因见明细"},
+            {"label": "转发关系版本", "value": f"v{version}",
+             "detail": f"提交运行时锁定，共 {len(links)} 对关系，重试沿用"},
+            {"label": "剔除跨批转发串", "value": len(chains),
+             "detail": f"整串剔除 {len(removed)} 封：训练 {cut_train} 封、留出 {cut_test} 封" if chains
+                       else "未发现横跨训练批与留出批的转发串"},
         ],
         "tables": [
             _table("逐件分流明细", _PREDICTION_COLUMNS, predictions),
             _table("队列负载与验收指标", _QUEUE_COLUMNS, queues),
+            _table("跨批转发串剔除明细", _EXCLUSION_COLUMNS, exclusions),
         ],
         "charts": [{
             "title": "留出来信的预计队列接件量", "kind": "bar",
@@ -226,6 +321,13 @@ def analyze(rows, normalized_params):
             "text": (
                 "预计接件量汇总模型去向，人工归口量汇总留出标签。错投会占用接件组的时间，也会让应接件组漏收。"
                 "结合逐件依据复核错投和分诊原因，沿用固定留出批比较阈值前后的覆盖率与宏 F1。"
+            ),
+        }, {
+            "title": "转发串剔除口径",
+            "text": (
+                "同一封来信多次转发后拆进训练批和留出批，验收分数会虚高。补录的转发关系按版本累积，"
+                "直接或间接串连的来信只要横跨两批即整串剔除，再重训并计分，剔除链路见明细表。"
+                f"本次按提交运行时锁定的版本 v{version} 计算，之后补录的关系需重新运行才生效。"
             ),
         }],
     }

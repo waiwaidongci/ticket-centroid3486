@@ -16,6 +16,9 @@ log = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app):
     Base.metadata.create_all(engine)
+    with engine.begin() as ddl:
+        # 002：runs 增加转发关系版本列（新表 forward_links 由 create_all 补建）
+        ddl.execute(text('ALTER TABLE runs ADD COLUMN IF NOT EXISTS relation_version INTEGER'))
     if SEED_DEMO:
         try:
             log.info('Seeded %s', seed())
